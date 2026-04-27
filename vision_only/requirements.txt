@@ -1,0 +1,9 @@
+# Branch A — Vision Only Odometry dependencies.
+# Install torch / torchvision separately so we can pick the right
+# CUDA build from the PyTorch index. The setup_env.slurm script handles that.
+
+numpy>=1.24
+Pillow>=10.0
+matplotlib>=3.7
+tensorboard>=2.14
+tqdm>=4.66
