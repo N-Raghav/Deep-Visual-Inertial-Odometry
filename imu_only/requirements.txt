@@ -1,0 +1,9 @@
+# IMU-only branch dependencies (AirIMU + AirIO + EKF).
+# Torch / torchvision are installed separately by setup_env.slurm so the
+# right CUDA build can be selected.
+
+numpy>=1.24
+matplotlib>=3.7
+tensorboard>=2.14
+tqdm>=4.66
+Pillow>=10.0
