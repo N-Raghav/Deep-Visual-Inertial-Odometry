@@ -1,0 +1,49 @@
+========================================================================
+Branch A vision-only odometry test
+  data_root:    /home/pbaskar/cv/P4/data_test
+  checkpoint:   /home/pbaskar/cv/P4/checkpoints/vision_only/best.pt
+  results_dir:  /home/pbaskar/cv/P4/results/vision_only_test
+  device:       cuda
+  img:          224×224
+  chunk_size:   10
+========================================================================
+
+loading checkpoint /home/pbaskar/cv/P4/checkpoints/vision_only/best.pt
+  trainable params: 2,884,681
+  trained epochs:   26
+  saved val_trans:  0.000004
+  train args:       lr=0.0001  lambda_rot=100.0  seq_len=10
+
+found 5 sequences: ['clover_100', 'figure8_100', 'figure8_3d_100', 'lemniscate_100', 'oval_100']
+
+--- trajectory metrics ---
+sequence                  ATE [m]    RTE [m]    rot [deg]   pairs   dur [s]
+---------------------------------------------------------------------------
+clover_100                 2.3926     0.0055       0.7471    1999      64.6
+figure8_100                2.7028     0.0056       0.3837    1999      63.5
+figure8_3d_100             3.2209     0.0088       0.6681    1999      63.3
+lemniscate_100             2.7395     0.0034       0.4260    1999      67.1
+oval_100                   3.1993     0.0050       0.3995    1999      66.7
+---------------------------------------------------------------------------
+  ATE [m]      mean=2.8510 median=2.7395 min=2.3926 max=3.2209 std=0.3171
+  RTE [m]      mean=0.0056 median=0.0055 min=0.0034 max=0.0088 std=0.0017
+  rot [deg]    mean=0.5249 median=0.4260 min=0.3837 max=0.7471 std=0.1519
+
+--- per-frame error metrics ---
+  (et = translation error [m], er = rotation error [deg])
+sequence                 et_mean    et_med    et_p95    et_max    er_mean    er_med    er_p95    er_max
+-------------------------------------------------------------------------------------------------------
+clover_100                0.0055    0.0053    0.0114    0.0116     0.7471    0.6286    1.5753    1.7707
+figure8_100               0.0056    0.0060    0.0097    0.0097     0.3837    0.3723    0.7220    0.9258
+figure8_3d_100            0.0088    0.0069    0.0217    0.0221     0.6681    0.6535    1.2276    1.3422
+lemniscate_100            0.0034    0.0037    0.0061    0.0061     0.4260    0.4329    0.8965    1.1523
+oval_100                  0.0050    0.0047    0.0093    0.0094     0.3995    0.4377    0.6646    0.8312
+-------------------------------------------------------------------------------------------------------
+  et_mean [m]      mean=0.0056 median=0.0055 min=0.0034 max=0.0088 std=0.0017
+  et_p95  [m]      mean=0.0116 median=0.0097 min=0.0061 max=0.0217 std=0.0053
+  er_mean [deg]    mean=0.5249 median=0.4260 min=0.3837 max=0.7471 std=0.1519
+  er_p95  [deg]    mean=1.0172 median=0.8965 min=0.6646 max=1.5753 std=0.3411
+
+wrote /home/pbaskar/cv/P4/results/vision_only_test/test_metrics.json
+wrote /home/pbaskar/cv/P4/results/vision_only_test/test_metrics.csv
+total elapsed: 645.7s

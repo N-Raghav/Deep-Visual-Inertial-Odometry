@@ -1,0 +1,62 @@
+======================================================================
+PRGFlow VIO test
+  data_root:   /home/pbaskar/cv/P4/data_test
+  pairs_root:  /home/pbaskar/cv/P4/data_test_preprocessed
+  checkpoint:  /home/pbaskar/cv/P4/checkpoints/vio/vio_hyp1/best.pt
+  results_dir: /home/pbaskar/cv/P4/results/vio_test/vio_hyp1
+  device:      cuda
+  crop_size:   128  pad: 0  beta: 0.08
+======================================================================
+preprocessing 15 trajectories from /home/pbaskar/cv/P4/data_test -> /home/pbaskar/cv/P4/data_test_preprocessed
+  preprocess: clover_100
+  preprocess: clover_101
+  preprocess: clover_102
+  preprocess: figure8_3d_100
+  preprocess: figure8_3d_101
+  preprocess: figure8_3d_102
+  preprocess: lemniscate_100
+  preprocess: lemniscate_101
+  preprocess: lemniscate_102
+  preprocess: oval_100
+  preprocess: oval_101
+  preprocess: oval_102
+  preprocess: spiral_100
+  preprocess: spiral_101
+  preprocess: spiral_102
+preprocessing took 63.2s
+loading checkpoint /home/pbaskar/cv/P4/checkpoints/vio/vio_hyp1/best.pt
+  params:   334,342
+  size_mb:  1.28
+  ckpt val_metrics: {'l2': 0.4717716165576475, 'e_trans': 0.4717699217611459, 'e_scale': 0.0532259494420318, 'acc': 100.0}
+  ckpt splits.train: ['clover_1', 'clover_2', 'clover_4', 'figure8_3d_0', 'figure8_3d_1', 'figure8_3d_4', 'lemniscate_0', 'lemniscate_1', 'lemniscate_2', 'lemniscate_3', 'lemniscate_4', 'oval_0', 'oval_1', 'oval_2', 'oval_3', 'oval_4', 'spiral_1', 'spiral_2', 'spiral_3', 'spiral_4']
+  ckpt splits.val:   ['figure8_3d_2', 'figure8_3d_3']
+  ckpt splits.test:  ['clover_0', 'clover_3', 'spiral_0']
+found 15 preprocessed trajectories
+
+--- patch-level evaluation ---
+sequence                    n        l2    eT_mean     eT_med     eT_p95    eS_mean     eS_med     acc%
+-------------------------------------------------------------------------------------------------------
+clover_100               1999    1.7805      1.781      1.235      4.456      0.271      0.295    62.93
+clover_101               1999    1.3717      1.372      1.201      2.774      0.137      0.124    80.74
+clover_102               1999    7.4181      7.418      5.199     23.518      0.766      0.626    15.86
+figure8_3d_100           1999    0.4326      0.433      0.352      1.009      0.045      0.039   100.00
+figure8_3d_101           1999    0.4243      0.424      0.360      0.936      0.035      0.028   100.00
+figure8_3d_102           1999    1.2491      1.249      1.157      2.499      0.090      0.085    82.79
+lemniscate_100           1999    0.5165      0.516      0.249      1.346      0.013      0.010   100.00
+lemniscate_101           1999    0.7222      0.722      0.496      1.665      0.059      0.043    99.65
+lemniscate_102           1999    0.9354      0.935      0.864      2.126      0.054      0.057    94.15
+oval_100                 1999    0.1249      0.125      0.104      0.330      0.011      0.008   100.00
+oval_101                 1999    0.2709      0.271      0.268      0.519      0.025      0.016   100.00
+oval_102                 1951    0.5529      0.553      0.527      0.989      0.009      0.008   100.00
+spiral_100               1630    0.3806      0.381      0.420      0.687      0.121      0.112   100.00
+spiral_101               1999    0.8531      0.853      0.800      1.649      0.171      0.169    98.65
+spiral_102               1141    1.1831      1.183      0.517      5.205      0.267      0.238    81.86
+-------------------------------------------------------------------------------------------------------
+  l2_mean                mean=1.2144 median=0.7222 min=0.1249 max=7.4181 std=1.7169
+  e_trans_mean_px        mean=1.2144 median=0.7222 min=0.1249 max=7.4181 std=1.7169
+  e_scale_mean_px        mean=0.1382 median=0.0587 min=0.0089 max=0.7660 std=0.1873
+  acc_pct                mean=87.7750 median=99.6498 min=15.8579 max=100.0000 std=21.9767
+
+--- trajectory-level evaluation (ATE/RTE/rot) ---
+sequence                    ATE [m]      RTE [m]      rot [deg]
+---------------------------------------------------------------
