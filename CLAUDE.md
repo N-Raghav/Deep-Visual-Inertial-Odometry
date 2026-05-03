@@ -42,26 +42,48 @@ Five trainable / runnable branches in total:
 ## Dataset format
 
 Every branch reads from a top-level dataset directory containing one
-sub-directory per trajectory:
+sub-directory per trajectory. The actual format on the cluster (after
+the dataset.py refactor in commit `6b2d17d`) is **multi-rate** with
+separate CSVs for each modality:
 
 ```
 dataset_root/
-  sequence_001/
-    frames/
-      frame_000000.png
-      frame_000001.png
-      ...
-    poses.txt   # 4x4 homogeneous body→world transform per line (16 floats)
-    imu.txt     # one IMU sample per line: [ax ay az gx gy gz]
-  sequence_002/
+  clover_100/
+    images/
+      000000.png
+      000001.png
+      ...                 # camera-rate, ≈100 Hz
+    frame_index.csv       # t, imu_index, image_path  (one row per frame)
+    poses_body.csv        # t, x, y, z, qw, qx, qy, qz  (IMU-rate, ≈1000 Hz)
+    imu_clean.csv         # t, gx, gy, gz, ax, ay, az   (IMU-rate, ≈1000 Hz)
+  clover_101/
     ...
 ```
 
+**Trajectory naming.** Sequences come in trajectory families
+(`clover`, `figure8`, `figure8_3d`, `lemniscate`, `oval`, `spiral`)
+with numerical suffixes that index difficulty:
+
+- `_100` — baseline maneuver (smooth, well-represented in training)
+- `_101` — moderate aggressiveness
+- `_102` — most aggressive (fastest yaw rates, sharpest turns)
+
+The `_102` instances cause the largest accuracy regressions across
+every method we've tested — see [Empirical observations](#empirical-observations-from-baseline-runs).
+
 **Conventions assumed by all branches**
 
-- Vision frames, IMU samples, and poses are **1:1 aligned in time** —
-  one IMU sample and one pose per video frame. The fusion branches
-  rely on this.
+- **Vision (camera) and IMU run at different rates** — typically 100 Hz
+  vs 1000 Hz (10:1). `frame_index.csv`'s ``imu_index`` column maps each
+  camera frame to its corresponding IMU sample.
+- Poses are stored as **unit quaternions** ``(qw, qx, qy, qz)`` plus
+  position, both at IMU rate. The shared helper
+  [`imu_only.utils.quat_to_rotmat_np`](imu_only/utils.py) converts
+  per-sequence quaternion arrays to ``(N, 3, 3)`` rotation matrices.
+- IMU CSV column order is `t, gx, gy, gz, ax, ay, az`
+  (gyro-then-accel). The dataset loaders extract `acc = data[:, 4:7]`
+  and `gyro = data[:, 1:4]`. Watch for this if you write any external
+  preprocessing — the convention differs from many ROS bag dumps.
 - IMU specific-force convention: `ᴮa = ᴮF/m + Rᵀᴳg` (an IMU at rest
   level on the ground reads ``+9.81`` along its body-up axis).
 - Gravity vector: `g = [0, 0, -9.81]` (Z-up world). Defined once in
@@ -71,6 +93,14 @@ dataset_root/
   `[0.229, 0.224, 0.225]`). Photometric augmentation in training is
   applied **identically** to the two frames of a pair so the relative
   pose label stays valid.
+
+**Pose representation in `fusion_common/dataset.py`.** Primary buffers
+(`acc`, `gyro`, `attitude`, `v_body`, `R`, `p`) are stored at IMU rate.
+Camera-rate views (`R_cam`, `p_cam`) are derived via the
+`frame_imu_indices` mapping. Loose fusion uses the IMU-rate buffers
+for its sample-by-sample EKF; the tight-fusion branches use the
+camera-rate views for trajectory comparison and IMU-rate context
+windows for AirIO input.
 
 ---
 
@@ -567,23 +597,151 @@ minute on a single GPU. Output ends with `All checks passed.`
 
 ## Common gotchas
 
-- The **`imu_only` branch's `IMUWindowDataset` does not need vision
-  frames** but the fusion branches' `PairedDataset` does. If you
-  generate IMU-only sequences without a `frames/` directory the
-  fusion branches will skip them silently.
-- `PairedDataset` assumes IMU rate == frame rate (1:1). If your
-  Blender pipeline produces 200 Hz IMU + 30 Hz video, **you must
-  subsample one or interpolate the other** before training the fusion
-  branches.
-- `loose_fusion` `_R_prev_vis` initialises to identity on `reset()`.
-  The first vision rotation update therefore is silently skipped
-  (innovation against itself); this is intentional but worth knowing.
-- Cross-attention's `pos_emb` has length `max_len=256` by default. If
-  you train with `--sequence_length > 256` you'll hit the runtime
-  check at the top of `forward`.
-- `AirIONet` clamps its `log_var` to `[-10, 10]`. If your loss starts
-  oscillating it is *not* because the variance is exploding —
+- **Validation Huber loss is a poor proxy for trajectory ATE.**
+  Empirically a 2.3× increase in val Huber on AirIO produced a 16×
+  increase in ATE on the same evaluation sequence. Do **not**
+  early-stop on Huber alone — track ATE on a held-out sequence during
+  training, even if it's expensive. See observation #3 below.
+- **Per-axis velocity errors are wildly asymmetric** in AirIO outputs.
+  On `clover` trajectories the Z-axis RMSE is 5× the X-axis RMSE; on
+  planar `oval` / `lemniscate` trajectories Y and Z errors are 2-3
+  orders of magnitude smaller than X. This isn't a bug — it's the
+  network failing to generalise across motion axes that aren't
+  well-represented in training. Symptom: huge ATE on the first
+  out-of-distribution trajectory family you evaluate.
+- **`acc_pct` / confidence outputs are modality-specific.** If a model
+  reports a translation-classification confidence, that signal can
+  be 100% on a sequence whose rotation error is 100°. Don't use a
+  single confidence channel as a global "did it work" signal.
+- **Adding a new prediction head without commensurate data hurts.**
+  PRGFlow's "improved" model with an added yaw head regressed 3-5×
+  on translation and 10-25× on rotation versus the no-yaw baseline
+  on the same evaluation set. Treat extra heads as a hypothesis to
+  test, not a free improvement.
+- **Watch for degenerate constants in metric outputs.** The PRGFlow
+  baseline's scale prediction is *literally constant* (0.00824) on
+  4 of 5 evaluation sequences — mean = p95 = max identically. The
+  network learned to output a default rather than predict scale.
+  If you see suspiciously low variance in any metric, plot the
+  per-frame distribution before trusting the mean.
+- **`loose_fusion._R_prev_vis` initialises to identity on `reset()`.**
+  The first vision rotation update is therefore silently skipped
+  (innovation against itself); intentional, but worth knowing.
+- **Cross-attention's `pos_emb` has length `max_len=256` by default.**
+  Training with `--sequence_length > 256` triggers the runtime check
+  at the top of `forward`.
+- **`AirIONet` clamps its `log_var` to `[-10, 10]`.** If your loss
+  starts oscillating it is *not* because the variance is exploding —
   investigate the Huber term first.
+
+---
+
+## Empirical observations from baseline runs
+
+The `results/` directory contains evaluations from before the fusion
+branches existed: BranchA (vision_only), AirIO+EKF (imu_only), and
+PRGFlow VIO (an external visual-inertial baseline not in this repo,
+but a useful comparator). Eight non-obvious findings worth remembering
+when interpreting future results:
+
+### 1. Better per-frame rotation can produce worse trajectories.
+BranchA's per-pair rotation error is **0.5°**; PRGFlow VIO's is
+**6.9°** — vision is 14× more accurate per frame. Yet PRGFlow's ATE
+is **0.72 m** vs BranchA's **2.87 m** — VIO is 4× better globally.
+Bias dominates trajectory error, not variance. Vision dead-reckons;
+VIO's IMU+EKF stops the bleed.
+
+### 2. AirIO doesn't generalise across motion axes despite physics being symmetric.
+
+| Family | rmse_vx | rmse_vy | rmse_vz |
+|---|---:|---:|---:|
+| oval (planar) | 0.17 | 0.004 | 0.04 |
+| clover (3D loops) | 0.52 | 0.34 | **2.79** |
+| spiral | 0.35 | 0.08 | 1.28 |
+
+The Z-axis error is 30× the X-axis error on `clover` even though
+accelerometer/gyro physics are identical for both axes. The network
+learned a motion-distribution prior, not an axis-symmetric inverse
+model. Strong argument for diversifying training trajectories or for
+data-augmentation that randomly rotates the body frame.
+
+### 3. Validation loss massively understates trajectory error.
+
+Same `clover_100` sequence on two AirIO checkpoints:
+
+| Checkpoint | val Huber | ATE | rotation |
+|---|---:|---:|---:|
+| run0 | 0.000139 | **0.78 m** | 14° |
+| new_data_run | 0.000538 | **12.73 m** | 104° |
+
+A 2.3× rise in Huber → 16× rise in ATE. Per-window velocity residuals
+can be sub-millimeter while the integrated trajectory drifts meters.
+Validation should include trajectory-level metrics.
+
+### 4. PRGFlow's confidence detector is rotation-blind.
+On `oval_102` the model self-reports `acc_pct = 100%` (perfectly
+confident) yet rotation error is **92.7°**. On `clover_102` it
+self-reports `acc_pct = 15.6%` with rotation error of 105° — knows it
+failed. The confidence head was trained on translation classification
+and never saw rotation residuals during supervision. Lesson: any
+confidence signal is partial, scoped to whatever it was supervised on.
+
+### 5. PRGFlow's "improved" model is worse than the baseline.
+Adding a 167K-parameter yaw head produced 3-5× worse translation and
+10-25× worse rotation on the same evaluation sequences. Capacity
+without commensurate data caused specialisation in yaw at the expense
+of translation generalisation.
+
+### 6. Scale prediction is a frozen constant on most sequences.
+PRGFlow VIO's `e_scale_mean`, `e_scale_p95`, and `e_scale_max` are all
+**identically `0.00824`** on 4 of 5 evaluation sequences. The network
+learned a degenerate solution where it outputs a constant rather than
+predicting scale. Worth adopting a habit: **always plot the per-frame
+distribution before trusting the mean** of a metric.
+
+### 7. AirIO's *capability* is excellent — generalisation is broken.
+- Best result: `oval_100`, ATE **0.24 m** in 20 s = 1.2 cm/s drift.
+- Worst result: `clover_102`, same network, same training: ATE
+  **26.9 m**.
+- Same parameters → 112× error gap from a 5% change in trajectory
+  shape. Frames the fusion work as solving generalisation, not
+  capability.
+
+### 8. AirIO is 30× faster than PRGFlow at inference.
+Wall-clock for evaluating 15 sequences: **AirIO+EKF = 71 s**,
+**PRGFlow_imp = 2279 s** (≈70% of which is preprocessing). The
+deployment story for onboard UAV use isn't accuracy alone — at the
+latency budget that matters for closed-loop control AirIO's
+accuracy gap is much smaller than the table suggests.
+
+### Implications for the fusion branches
+
+These observations directly motivate specific fusion design choices:
+
+- **Loose fusion's vision-rotation update is the highest-leverage
+  measurement.** AirIO rotations drift 8-119° while BranchA rotations
+  are sub-degree per frame — feeding vision rotation into the EKF
+  patches AirIO's biggest weakness. Tune
+  `--vision_rot_sigma_deg` aggressively low (0.1-0.3°) before
+  `--vision_vel_sigma`.
+- **Gated fusion should learn `g → 1` (trust vision) on `_102`
+  instances.** Plot `<seq>_gate.png` for `clover_102` after training:
+  if the gate isn't strongly biased toward vision there, the network
+  hasn't learned the right behaviour.
+- **Cross-attention's interpretability is via `vis_imu_cos`.** Low
+  cosine similarity on `clover_102` means the modalities disagree
+  (which is correct — IMU is failing) and the transformer is
+  reconciling. High cosine similarity on planar trajectories means
+  the modalities concur.
+- **Validation strategy for the fusion branches.** Don't just track
+  the pose loss. Pick 1-2 held-out sequences with different
+  trajectory families and report ATE per epoch. The Huber/pose-loss
+  validation curve will look smooth while ATE silently regresses.
+- **The bar to beat (small set, 5 trajectories).** PRGFlow VIO scores
+  ATE 0.72 m, RTE 0.005 m, rotation 6.9°. Loose fusion is unlikely to
+  beat this outright (PRGFlow is already tightly-coupled VIO); the
+  interesting comparison is `gated_fusion` and `cross_attention`
+  versus PRGFlow on identical sequences.
 
 ---
 
