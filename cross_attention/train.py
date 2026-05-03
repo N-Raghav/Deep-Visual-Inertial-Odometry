@@ -42,8 +42,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr_finetune", type=float, default=2e-5)
     p.add_argument("--lambda_rot", type=float, default=100.0)
     p.add_argument("--sequence_length", type=int, default=10)
-    p.add_argument("--imu_context", type=int, default=32)
-    p.add_argument("--imu_rate", type=float, default=30.0)
+    p.add_argument("--imu_context", type=int, default=100)
+    p.add_argument("--imu_rate", type=float, default=1000.0)
     p.add_argument("--img_height", type=int, default=224)
     p.add_argument("--img_width", type=int, default=224)
     # Transformer-specific:

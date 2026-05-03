@@ -1,40 +1,32 @@
 """
 Paired vision + IMU dataset shared by all three fusion branches.
 
-Assumes a per-sequence layout identical to the one used by the existing
-``vision_only/`` and ``imu_only/`` branches::
+Each sequence directory has the layout::
 
-    sequence_001/
-        frames/
-            frame_000000.png
-            frame_000001.png
+    sequence/
+        images/
+            000000.png
             ...
-        poses.txt   # one 4x4 transform per line (16 floats)
-        imu.txt     # one IMU sample per line: [ax ay az gx gy gz]
+        frame_index.csv   # t, imu_index, image_path  (camera-rate)
+        poses_body.csv    # t, x, y, z, qw, qx, qy, qz  (IMU-rate)
+        imu_clean.csv     # t, gx, gy, gz, ax, ay, az   (IMU-rate)
 
-We assume **vision frames and IMU samples are 1:1** (one IMU sample per
-frame / per pose). At frame index ``t`` the IMU sample, the pose, and
-the image are all from the same instant.
+The camera runs at a lower rate than the IMU (e.g. 100 Hz vs 1000 Hz).
+``frame_index.csv`` maps each camera frame to its corresponding IMU sample
+index, providing the alignment between the two streams.
 
-Each ``__getitem__`` returns a sliding window of ``T`` *frame pairs*.
-For every pair ``i`` (between absolute time-step ``start + i`` and
-``start + i + 1``) the item carries:
-
-    - the two RGB frames (already ImageNet-normalised),
-    - an IMU context window of length ``imu_context`` ending at the
-      next-frame time-step (so AirIO's GRU has enough history),
-    - the per-sample attitude inside that IMU window,
-    - the body-frame velocity ground-truth at the next-frame time-step,
-    - the relative pose ground-truth ``T_rel = inv(T_t) @ T_t1``.
-
-The fusion branches use the relative pose for supervision and the IMU /
-attitude / body-velocity to drive AirIMU + AirIO inside the model.
+Primary arrays (``acc``, ``gyro``, ``attitude``, ``v_body``, ``R``, ``p``)
+are stored at **IMU rate** — this is what loose_fusion needs for its
+sample-by-sample EKF.  Camera-rate views ``R_cam`` and ``p_cam`` are
+derived from the IMU-rate arrays via ``frame_imu_indices``.  Gated and
+cross-attention branches use these camera-rate views for trajectory
+comparison and the ``imu_context`` windows for AirIO input.
 """
 
 from __future__ import annotations
 
+import csv
 import warnings
-from glob import glob
 from pathlib import Path
 from typing import Any
 
@@ -44,11 +36,12 @@ import torchvision.transforms.functional as TF
 from PIL import Image
 from torch.utils.data import Dataset
 
-# Sibling-branch imports — the fusion entry points add the project root
-# to ``sys.path`` before importing this module, so these resolve.
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from imu_only.utils import (
     attitude_logmap_from_poses,
     body_frame_velocity_from_poses,
+    quat_to_rotmat_np,
 )
 
 
@@ -56,63 +49,99 @@ _IMAGENET_MEAN = (0.485, 0.456, 0.406)
 _IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
+def _read_frame_index(root: Path) -> tuple[list[str], np.ndarray]:
+    """Return (frame_file_paths, imu_indices) from frame_index.csv."""
+    paths: list[str] = []
+    imu_indices: list[int] = []
+    with open(root / "frame_index.csv") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            paths.append(str(root / row["image_path"]))
+            imu_indices.append(int(row["imu_index"]))
+    return paths, np.array(imu_indices, dtype=np.int64)
+
+
+def _load_imu_csv(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    data = np.loadtxt(path, delimiter=",", skiprows=1)
+    gyro = data[:, 1:4].astype(np.float32)  # gx, gy, gz
+    acc = data[:, 4:7].astype(np.float32)   # ax, ay, az
+    return acc, gyro
+
+
+def _load_poses_csv(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    data = np.loadtxt(path, delimiter=",", skiprows=1)
+    p = data[:, 1:4].astype(np.float64)
+    R = quat_to_rotmat_np(data[:, 4], data[:, 5], data[:, 6], data[:, 7])
+    return R, p
+
+
 class _PairedSequence:
-    """In-memory description of a single trajectory: poses + IMU + frames."""
+    """In-memory description of a single trajectory: poses + IMU + frames.
+
+    Attributes at IMU rate (primary, length ``n``):
+        acc, gyro, attitude, v_body, R, p, dt
+
+    Camera-rate views (length ``n_cam``):
+        frame_files, frame_imu_indices, R_cam, p_cam, dt_cam
+    """
 
     def __init__(self, root: Path, imu_rate: float) -> None:
         self.root = root
-        # Poses + IMU.
-        poses = np.loadtxt(root / "poses.txt", dtype=np.float64)
-        imu = np.loadtxt(root / "imu.txt", dtype=np.float64)
-        if poses.ndim == 1:
-            poses = poses[None, :]
-        if imu.ndim == 1:
-            imu = imu[None, :]
-        if poses.shape[1] != 16:
-            raise RuntimeError(f"{root}/poses.txt must have 16 floats per line")
-        if imu.shape[1] != 6:
-            raise RuntimeError(f"{root}/imu.txt must have 6 floats per line")
 
-        # Frames.
-        frame_files = sorted(glob(str(root / "frames" / "frame_*.png")))
-        n = min(poses.shape[0], imu.shape[0], len(frame_files))
-        if not (poses.shape[0] == imu.shape[0] == len(frame_files)):
+        frame_files, frame_imu_indices = _read_frame_index(root)
+        acc, gyro = _load_imu_csv(root / "imu_clean.csv")
+        R_imu, p_imu = _load_poses_csv(root / "poses_body.csv")
+
+        n_imu = min(len(acc), len(R_imu))
+        if len(acc) != len(R_imu):
             warnings.warn(
-                f"{root}: poses({poses.shape[0]}) imu({imu.shape[0]}) "
-                f"frames({len(frame_files)}) differ; truncating to {n}"
+                f"{root}: imu ({len(acc)}) and poses ({len(R_imu)}) "
+                f"differ; truncating to {n_imu}"
             )
-        self.frame_files = frame_files[:n]
-        self.T = poses[:n].reshape(n, 4, 4)
-        self.R = self.T[:, :3, :3].astype(np.float64)
-        self.p = self.T[:, :3, 3].astype(np.float64)
-        self.acc = imu[:n, :3].astype(np.float32)
-        self.gyro = imu[:n, 3:].astype(np.float32)
 
+        # Clip camera frames to those whose IMU index is in range.
+        valid = frame_imu_indices < n_imu
+        frame_files = [frame_files[i] for i in range(len(frame_files)) if valid[i]]
+        frame_imu_indices = frame_imu_indices[valid]
+
+        self.acc = acc[:n_imu]
+        self.gyro = gyro[:n_imu]
+        self.R = R_imu[:n_imu].astype(np.float64)
+        self.p = p_imu[:n_imu].astype(np.float64)
         self.dt = 1.0 / float(imu_rate)
         self.imu_rate = float(imu_rate)
-        self.n = n
+        self.n = n_imu  # primary count — used by loose_fusion EKF loop
 
-        # Labels.
         self.v_body = body_frame_velocity_from_poses(self.R, self.p, self.dt).astype(
             np.float32
         )
         self.attitude = attitude_logmap_from_poses(self.R).astype(np.float32)
 
+        # Camera-rate views.
+        self.frame_files = frame_files
+        self.frame_imu_indices = frame_imu_indices  # (n_cam,) int64
+        self.n_cam = len(frame_files)
+        self.R_cam = self.R[frame_imu_indices]   # (n_cam, 3, 3)
+        self.p_cam = self.p[frame_imu_indices]   # (n_cam, 3)
+
+        # Camera timestep derived from consecutive frame IMU indices.
+        if len(frame_imu_indices) >= 2:
+            self.dt_cam = float(frame_imu_indices[1] - frame_imu_indices[0]) * self.dt
+        else:
+            self.dt_cam = self.dt
+
 
 class PairedDataset(Dataset):
-    """Sliding window of frame pairs with synchronized IMU context.
+    """Sliding window of camera-rate frame pairs with IMU-rate context.
 
     Args:
         root_dir: Top-level dataset directory.
         sequence_length: ``T`` — number of frame pairs per training window.
-        imu_context: number of IMU samples to feed AirIO per frame pair.
-            Larger values give the IMU GRU more temporal context but cost
-            memory. Defaults to 32 (≈1 s at 30 Hz).
+        imu_context: Number of IMU samples to feed AirIO per frame pair.
+            The window ends at the IMU sample aligned with the next frame.
         img_height / img_width: image resize target.
-        imu_rate: IMU sample rate (Hz). With 1:1 frame:IMU pairing this
-            is the same as the camera rate.
-        augment: photometric jitter on frame pairs (same jitter applied
-            to both frames of a pair to keep the relative pose valid).
+        imu_rate: IMU sample rate in Hz. Defaults to 1000.
+        augment: photometric jitter on frame pairs.
         sequences: optional explicit list of sequence directory names.
     """
 
@@ -120,10 +149,10 @@ class PairedDataset(Dataset):
         self,
         root_dir: str,
         sequence_length: int = 10,
-        imu_context: int = 32,
+        imu_context: int = 100,
         img_height: int = 224,
         img_width: int = 224,
-        imu_rate: float = 30.0,
+        imu_rate: float = 1000.0,
         augment: bool = False,
         sequences: list[str] | None = None,
     ) -> None:
@@ -139,23 +168,21 @@ class PairedDataset(Dataset):
             seq_dirs = sorted(
                 d for d in self.root_dir.iterdir()
                 if d.is_dir()
-                and (d / "frames").exists()
-                and (d / "poses.txt").exists()
-                and (d / "imu.txt").exists()
+                and (d / "images").exists()
+                and (d / "frame_index.csv").exists()
+                and (d / "poses_body.csv").exists()
+                and (d / "imu_clean.csv").exists()
             )
         else:
             seq_dirs = [self.root_dir / name for name in sequences]
 
         self.sequences: list[_PairedSequence] = []
-        # Each entry is (sequence_index, window_start). The window covers
-        # frames [start .. start + T] (T+1 frames produce T pairs).
         self.index: list[tuple[int, int]] = []
         for seq_dir in seq_dirs:
             seq = _PairedSequence(seq_dir, imu_rate=self.imu_rate)
-            n_pairs = seq.n - 1
-            # Need imu_context history before the first frame of the window.
-            min_start = self.imu_context
-            max_start = n_pairs - self.sequence_length + 1
+            # First camera frame index that has >= imu_context IMU samples of history.
+            min_start = int(np.searchsorted(seq.frame_imu_indices, self.imu_context - 1))
+            max_start = seq.n_cam - self.sequence_length
             if max_start <= min_start:
                 continue
             seq_idx = len(self.sequences)
@@ -171,14 +198,14 @@ class PairedDataset(Dataset):
 
     @staticmethod
     def list_sequences(root_dir: str) -> list[str]:
-        """Return sequence directories that have all three required files."""
         root = Path(root_dir)
         return sorted(
             d.name for d in root.iterdir()
             if d.is_dir()
-            and (d / "frames").exists()
-            and (d / "poses.txt").exists()
-            and (d / "imu.txt").exists()
+            and (d / "images").exists()
+            and (d / "frame_index.csv").exists()
+            and (d / "poses_body.csv").exists()
+            and (d / "imu_clean.csv").exists()
         )
 
     def __len__(self) -> int:
@@ -198,7 +225,6 @@ class PairedDataset(Dataset):
 
         frames_t = torch.empty((T, 3, self.img_height, self.img_width), dtype=torch.float32)
         frames_t1 = torch.empty_like(frames_t)
-        # IMU context per pair — for pair i we use samples [start + i + 1 - W .. start + i + 1).
         imu_acc = torch.empty((T, W, 3), dtype=torch.float32)
         imu_gyro = torch.empty((T, W, 3), dtype=torch.float32)
         attitude = torch.empty((T, W, 3), dtype=torch.float32)
@@ -207,8 +233,8 @@ class PairedDataset(Dataset):
         rel_t = torch.empty((T, 3), dtype=torch.float32)
 
         for i in range(T):
-            t0 = start + i           # frame at time t
-            t1 = start + i + 1       # frame at time t+1
+            t0 = start + i       # camera frame index
+            t1 = start + i + 1   # camera frame index
 
             f0 = self._load_image(seq.frame_files[t0])
             f1 = self._load_image(seq.frame_files[t1])
@@ -224,18 +250,19 @@ class PairedDataset(Dataset):
             frames_t[i] = f0
             frames_t1[i] = f1
 
-            imu_lo = t1 - W + 1   # inclusive
-            imu_hi = t1 + 1       # exclusive
-            imu_acc[i] = torch.from_numpy(seq.acc[imu_lo:imu_hi])
-            imu_gyro[i] = torch.from_numpy(seq.gyro[imu_lo:imu_hi])
-            attitude[i] = torch.from_numpy(seq.attitude[imu_lo:imu_hi])
-            v_body_gt[i] = torch.from_numpy(seq.v_body[t1])
+            # IMU context: W samples ending at the IMU index of frame t1.
+            imu_hi = int(seq.frame_imu_indices[t1])
+            imu_lo = imu_hi - W + 1
+            imu_acc[i] = torch.from_numpy(seq.acc[imu_lo : imu_hi + 1])
+            imu_gyro[i] = torch.from_numpy(seq.gyro[imu_lo : imu_hi + 1])
+            attitude[i] = torch.from_numpy(seq.attitude[imu_lo : imu_hi + 1])
+            v_body_gt[i] = torch.from_numpy(seq.v_body[imu_hi])
 
-            T_t = seq.T[t0]
-            T_t1 = seq.T[t1]
-            T_rel = np.linalg.inv(T_t) @ T_t1
-            rel_R[i] = torch.from_numpy(T_rel[:3, :3].astype(np.float32))
-            rel_t[i] = torch.from_numpy(T_rel[:3, 3].astype(np.float32))
+            # Relative pose from camera-rate poses.
+            R_rel = seq.R_cam[t0].T @ seq.R_cam[t1]
+            t_rel = seq.R_cam[t0].T @ (seq.p_cam[t1] - seq.p_cam[t0])
+            rel_R[i] = torch.from_numpy(R_rel.astype(np.float32))
+            rel_t[i] = torch.from_numpy(t_rel.astype(np.float32))
 
         return {
             "frames_t": frames_t,

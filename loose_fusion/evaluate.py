@@ -62,7 +62,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--airio_checkpoint", type=str, required=True)
     p.add_argument("--airimu_checkpoint", type=str, default=None)
     p.add_argument("--results_dir", type=str, default="results/loose_fusion")
-    p.add_argument("--imu_rate", type=float, default=30.0)
+    p.add_argument("--imu_rate", type=float, default=1000.0)
     p.add_argument("--img_height", type=int, default=224)
     p.add_argument("--img_width", type=int, default=224)
     p.add_argument("--vision_chunk", type=int, default=10)
@@ -94,7 +94,7 @@ def _vision_predict_sequence(
     img_w: int,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Run BranchA across the whole sequence and return per-pair (R, t)."""
-    n_pairs = seq.n - 1
+    n_pairs = seq.n_cam - 1
     rel_R = np.zeros((n_pairs, 3, 3), dtype=np.float64)
     rel_t = np.zeros((n_pairs, 3), dtype=np.float64)
     hidden = None
@@ -182,9 +182,14 @@ def _run_pipeline(
         airimu, airio, seq, device, args.airio_chunk
     )
 
-    n = seq.n
-    dt = seq.dt
-    dt_frame = dt  # 1:1 frame:IMU pairing
+    n = seq.n          # number of IMU samples
+    dt = seq.dt        # IMU timestep (e.g. 1/1000 s)
+    dt_frame = seq.dt_cam  # camera frame interval (e.g. 1/100 s)
+
+    # Build mapping: IMU sample index → camera frame index k (pair k-1 → k).
+    imu_to_frame: dict[int, int] = {
+        int(idx): k for k, idx in enumerate(seq.frame_imu_indices)
+    }
 
     ekf = FusionEKF()
     ekf.reset(
@@ -208,17 +213,19 @@ def _run_pipeline(
         if not args.no_imu_update:
             ekf.update_velocity(v_body_meas=v_pred[i], log_var=log_var[i])
 
-        # Vision update: with 1:1 pairing, every step has a vision pair.
-        if not args.no_vision:
-            ekf.update_vision_velocity(
-                delta_t_vis=rel_t_vis[i - 1],
-                dt_frame=dt_frame,
-                sigma=args.vision_vel_sigma,
-            )
-            ekf.update_vision_rotation(
-                delta_R_vis=rel_R_vis[i - 1],
-                sigma_deg=args.vision_rot_sigma_deg,
-            )
+        # Vision update only at camera frame times.
+        if not args.no_vision and i in imu_to_frame:
+            k = imu_to_frame[i]
+            if k > 0:  # frame pair (k-1) → k exists in rel_R_vis / rel_t_vis
+                ekf.update_vision_velocity(
+                    delta_t_vis=rel_t_vis[k - 1],
+                    dt_frame=dt_frame,
+                    sigma=args.vision_vel_sigma,
+                )
+                ekf.update_vision_rotation(
+                    delta_R_vis=rel_R_vis[k - 1],
+                    sigma_deg=args.vision_rot_sigma_deg,
+                )
 
         pos_traj[i] = ekf.p
         R_traj[i] = ekf.R

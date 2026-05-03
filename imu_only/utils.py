@@ -136,6 +136,22 @@ def so3_right_jacobian(phi: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 # Numpy versions (used by EKF in evaluation, pose-loading code)
 # ---------------------------------------------------------------------------
+def quat_to_rotmat_np(qw: np.ndarray, qx: np.ndarray,
+                      qy: np.ndarray, qz: np.ndarray) -> np.ndarray:
+    """Unit quaternions (n,) → rotation matrices (n, 3, 3)."""
+    R = np.empty((len(qw), 3, 3), dtype=np.float64)
+    R[:, 0, 0] = 1 - 2 * (qy ** 2 + qz ** 2)
+    R[:, 0, 1] = 2 * (qx * qy - qz * qw)
+    R[:, 0, 2] = 2 * (qx * qz + qy * qw)
+    R[:, 1, 0] = 2 * (qx * qy + qz * qw)
+    R[:, 1, 1] = 1 - 2 * (qx ** 2 + qz ** 2)
+    R[:, 1, 2] = 2 * (qy * qz - qx * qw)
+    R[:, 2, 0] = 2 * (qx * qz - qy * qw)
+    R[:, 2, 1] = 2 * (qy * qz + qx * qw)
+    R[:, 2, 2] = 1 - 2 * (qx ** 2 + qy ** 2)
+    return R
+
+
 def so3_hat_np(v: np.ndarray) -> np.ndarray:
     return np.array(
         [[0.0, -v[2], v[1]], [v[2], 0.0, -v[0]], [-v[1], v[0], 0.0]], dtype=v.dtype
