@@ -1,25 +1,24 @@
 """
-PyTorch dataset for the Blender-rendered UAV odometry sequences.
+PyTorch dataset for UAV odometry sequences.
 
-Each top-level sequence directory looks like::
+Each sequence directory has the layout produced by the Blender pipeline::
 
-    sequence_001/
-        frames/
-            frame_000000.png
-            frame_000001.png
+    sequence/
+        images/
+            000000.png
+            000001.png
             ...
-        poses.txt   # one 4x4 homogeneous transform per line (16 floats)
-        imu.txt     # one IMU reading per line: [ax ay az gx gy gz]
+        frame_index.csv   # t, imu_index, image_path  (camera-rate)
+        poses_body.csv    # t, x, y, z, qw, qx, qy, qz  (IMU-rate)
+        imu_clean.csv     # t, gx, gy, gz, ax, ay, az   (IMU-rate, unused here)
 
 The dataset slices each sequence into windows of ``sequence_length`` frame
-pairs and returns the relative pose between consecutive frames inside
-the window.
+pairs and returns the relative pose between consecutive frames.
 """
 
 from __future__ import annotations
 
-import os
-from glob import glob
+import csv
 from pathlib import Path
 from typing import Any
 
@@ -31,56 +30,81 @@ from torch.utils.data import Dataset
 
 
 _IMAGENET_MEAN = (0.485, 0.456, 0.406)
+
+
+def _quat_to_rotmat(qw: np.ndarray, qx: np.ndarray,
+                    qy: np.ndarray, qz: np.ndarray) -> np.ndarray:
+    """Unit quaternions (n,) → rotation matrices (n, 3, 3)."""
+    R = np.empty((len(qw), 3, 3), dtype=np.float64)
+    R[:, 0, 0] = 1 - 2 * (qy ** 2 + qz ** 2)
+    R[:, 0, 1] = 2 * (qx * qy - qz * qw)
+    R[:, 0, 2] = 2 * (qx * qz + qy * qw)
+    R[:, 1, 0] = 2 * (qx * qy + qz * qw)
+    R[:, 1, 1] = 1 - 2 * (qx ** 2 + qz ** 2)
+    R[:, 1, 2] = 2 * (qy * qz - qx * qw)
+    R[:, 2, 0] = 2 * (qx * qz - qy * qw)
+    R[:, 2, 1] = 2 * (qy * qz + qx * qw)
+    R[:, 2, 2] = 1 - 2 * (qx ** 2 + qy ** 2)
+    return R
 _IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
-class _Sequence:
-    """In-memory description of a single trajectory.
+def _read_frame_index(root: Path) -> tuple[list[str], np.ndarray]:
+    """Return (frame_file_paths, imu_indices) from frame_index.csv."""
+    paths = []
+    imu_indices = []
+    with open(root / "frame_index.csv") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            paths.append(str(root / row["image_path"]))
+            imu_indices.append(int(row["imu_index"]))
+    return paths, np.array(imu_indices, dtype=np.int64)
 
-    The class precomputes the relative pose between consecutive frames and
-    the list of valid window starting indices, so ``__getitem__`` only has
-    to load frames and return slices.
-    """
+
+def _load_camera_rate_poses(root: Path, imu_indices: np.ndarray) -> np.ndarray:
+    """Load poses_body.csv and return 4×4 matrices at camera-rate timestamps."""
+    data = np.loadtxt(root / "poses_body.csv", delimiter=",", skiprows=1)
+    # columns: t, x, y, z, qw, qx, qy, qz
+    xyz = data[imu_indices, 1:4]
+    qw = data[imu_indices, 4]
+    qx = data[imu_indices, 5]
+    qy = data[imu_indices, 6]
+    qz = data[imu_indices, 7]
+    R = _quat_to_rotmat(qw, qx, qy, qz)  # (n_cam, 3, 3)
+    n = len(imu_indices)
+    T = np.zeros((n, 4, 4), dtype=np.float64)
+    T[:, :3, :3] = R
+    T[:, :3, 3] = xyz
+    T[:, 3, 3] = 1.0
+    return T
+
+
+class _Sequence:
+    """In-memory description of a single trajectory."""
 
     def __init__(self, root: Path, sequence_length: int) -> None:
         self.root = root
         self.sequence_length = sequence_length
 
-        frame_files = sorted(glob(str(root / "frames" / "frame_*.png")))
+        frame_files, imu_indices = _read_frame_index(root)
         if len(frame_files) < 2:
             raise RuntimeError(f"sequence {root} has fewer than 2 frames")
         self.frame_files = frame_files
 
-        # Load absolute poses as 4x4 matrices.
-        poses = np.loadtxt(root / "poses.txt", dtype=np.float64)
-        if poses.ndim == 1:
-            poses = poses[None, :]
-        if poses.shape[1] != 16:
-            raise RuntimeError(
-                f"poses.txt in {root} must have 16 floats per line, got {poses.shape[1]}"
-            )
-        self.abs_poses = poses.reshape(-1, 4, 4)
+        abs_poses = _load_camera_rate_poses(root, imu_indices)
+        n_frames = len(self.frame_files)
 
-        n_frames = min(len(self.frame_files), self.abs_poses.shape[0])
-        self.frame_files = self.frame_files[:n_frames]
-        self.abs_poses = self.abs_poses[:n_frames]
-
-        # Relative poses between consecutive frames.
         self.rel_R = np.zeros((n_frames - 1, 3, 3), dtype=np.float32)
         self.rel_t = np.zeros((n_frames - 1, 3), dtype=np.float32)
         for i in range(n_frames - 1):
-            T_t = self.abs_poses[i]
-            T_t1 = self.abs_poses[i + 1]
-            T_rel = np.linalg.inv(T_t) @ T_t1
+            T_rel = np.linalg.inv(abs_poses[i]) @ abs_poses[i + 1]
             self.rel_R[i] = T_rel[:3, :3]
             self.rel_t[i] = T_rel[:3, 3]
 
         self.num_pairs = n_frames - 1
-        # Number of length-T windows that fit into this sequence.
         self.num_windows = max(0, self.num_pairs - sequence_length + 1)
 
     def window(self, start: int) -> tuple[list[str], list[str], np.ndarray, np.ndarray]:
-        """Return the file paths and ground-truth pose for one window."""
         T = self.sequence_length
         files_t = self.frame_files[start : start + T]
         files_t1 = self.frame_files[start + 1 : start + 1 + T]
@@ -90,21 +114,7 @@ class _Sequence:
 
 
 class UAVOdometryDataset(Dataset):
-    """Dataset of fixed-length windows of frame pairs and relative poses.
-
-    Args:
-        root_dir: Directory containing the per-sequence subdirectories.
-        sequence_length: ``T`` in the network forward pass — the number of
-            frame pairs in one training window.
-        img_height: Image height after resize.
-        img_width: Image width after resize.
-        augment: If ``True`` apply photometric jitter (brightness +
-            contrast) consistently to both frames in a pair. No geometric
-            augmentation is ever applied because that would change the
-            ground-truth relative pose.
-        sequences: Optional explicit list of sequence directory names to
-            include (used by ``train.py`` for the train/val split).
-    """
+    """Dataset of fixed-length windows of frame pairs and relative poses."""
 
     def __init__(
         self,
@@ -123,13 +133,16 @@ class UAVOdometryDataset(Dataset):
 
         if sequences is None:
             seq_dirs = sorted(
-                d for d in self.root_dir.iterdir() if d.is_dir() and (d / "frames").exists()
+                d for d in self.root_dir.iterdir()
+                if d.is_dir()
+                and (d / "images").exists()
+                and (d / "frame_index.csv").exists()
+                and (d / "poses_body.csv").exists()
             )
         else:
             seq_dirs = [self.root_dir / name for name in sequences]
 
         self.sequences: list[_Sequence] = []
-        # Each entry is (sequence_index, window_start_index).
         self.index: list[tuple[int, int]] = []
         for seq_dir in seq_dirs:
             seq = _Sequence(seq_dir, sequence_length)
@@ -146,28 +159,25 @@ class UAVOdometryDataset(Dataset):
                 f"sequence_length={sequence_length}"
             )
 
-    # ------------------------------------------------------------------
     @staticmethod
     def list_sequences(root_dir: str) -> list[str]:
-        """Return the sorted list of sequence directory names under ``root_dir``."""
         root = Path(root_dir)
         return sorted(
-            d.name for d in root.iterdir() if d.is_dir() and (d / "frames").exists()
+            d.name for d in root.iterdir()
+            if d.is_dir()
+            and (d / "images").exists()
+            and (d / "frame_index.csv").exists()
+            and (d / "poses_body.csv").exists()
         )
 
-    # ------------------------------------------------------------------
     def __len__(self) -> int:
         return len(self.index)
 
-    # ------------------------------------------------------------------
     def _load_image(self, path: str) -> torch.Tensor:
-        """Load an image, resize, and convert to a float tensor in ``[0, 1]``."""
         img = Image.open(path).convert("RGB")
         img = img.resize((self.img_width, self.img_height), Image.BILINEAR)
-        tensor = TF.to_tensor(img)  # [3, H, W] in [0, 1]
-        return tensor
+        return TF.to_tensor(img)
 
-    # ------------------------------------------------------------------
     def __getitem__(self, idx: int) -> dict[str, Any]:
         seq_idx, start = self.index[idx]
         seq = self.sequences[seq_idx]
@@ -177,8 +187,6 @@ class UAVOdometryDataset(Dataset):
         frames_t = torch.empty((T, 3, self.img_height, self.img_width), dtype=torch.float32)
         frames_t1 = torch.empty_like(frames_t)
 
-        # Sample one augmentation per pair, applied identically to both
-        # frames of the pair so that the relative pose stays valid.
         for i in range(T):
             f_t = self._load_image(files_t[i])
             f_t1 = self._load_image(files_t1[i])
@@ -194,10 +202,9 @@ class UAVOdometryDataset(Dataset):
             frames_t[i] = f_t
             frames_t1[i] = f_t1
 
-        R_gt = torch.from_numpy(rel_R.astype(np.float32))           # [T, 3, 3]
-        trans_gt = torch.from_numpy(rel_t.astype(np.float32))       # [T, 3]
-        # 6D ground truth = first two columns of R_gt, flattened.
-        rot_6d_gt = torch.cat([R_gt[:, :, 0], R_gt[:, :, 1]], dim=-1)  # [T, 6]
+        R_gt = torch.from_numpy(rel_R.astype(np.float32))
+        trans_gt = torch.from_numpy(rel_t.astype(np.float32))
+        rot_6d_gt = torch.cat([R_gt[:, :, 0], R_gt[:, :, 1]], dim=-1)
 
         return {
             "frames_t": frames_t,

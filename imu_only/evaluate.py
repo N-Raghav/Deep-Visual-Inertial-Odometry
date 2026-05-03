@@ -56,7 +56,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--airio_checkpoint", type=str, required=True)
     p.add_argument("--airimu_checkpoint", type=str, default=None)
     p.add_argument("--results_dir", type=str, default="results/imu_only")
-    p.add_argument("--imu_rate", type=float, default=200.0)
+    p.add_argument("--imu_rate", type=float, default=1000.0)
     p.add_argument("--airio_chunk", type=int, default=1000,
                    help="Number of IMU samples per AirIO forward pass.")
     p.add_argument("--rte_interval", type=float, default=5.0,

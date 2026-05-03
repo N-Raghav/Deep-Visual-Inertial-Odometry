@@ -46,8 +46,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--data_root", type=str, required=True)
     p.add_argument("--checkpoint", type=str, required=True)
     p.add_argument("--results_dir", type=str, default="results/gated_fusion")
-    p.add_argument("--imu_rate", type=float, default=30.0)
-    p.add_argument("--imu_context", type=int, default=32)
+    p.add_argument("--imu_rate", type=float, default=1000.0)
+    p.add_argument("--imu_context", type=int, default=100)
     p.add_argument("--img_height", type=int, default=224)
     p.add_argument("--img_width", type=int, default=224)
     p.add_argument("--rte_interval", type=float, default=5.0)
@@ -73,11 +73,12 @@ def _predict_sequence(
     img_w: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Forward the model across a sequence; returns (trans, R, gate)."""
-    n_pairs = seq.n - 1
+    n_pairs = seq.n_cam - 1
     rel_t = np.zeros((n_pairs, 3), dtype=np.float64)
     rel_R = np.zeros((n_pairs, 3, 3), dtype=np.float64)
     gate_log = np.zeros((n_pairs,), dtype=np.float64)
-    pos = imu_context  # ensure enough IMU history before the first pair
+    # First camera frame index that has >= imu_context IMU samples of history.
+    pos = int(np.searchsorted(seq.frame_imu_indices, imu_context - 1))
     rel_t_offset = pos
     while pos < n_pairs:
         end = min(pos + chunk, n_pairs)
@@ -92,11 +93,11 @@ def _predict_sequence(
             t1 = pos + i + 1
             f0[0, i] = _load_image(seq.frame_files[t0], img_h, img_w)
             f1[0, i] = _load_image(seq.frame_files[t1], img_h, img_w)
-            lo = t1 - imu_context + 1
-            hi = t1 + 1
-            acc[0, i] = torch.from_numpy(seq.acc[lo:hi])
-            gyro[0, i] = torch.from_numpy(seq.gyro[lo:hi])
-            att[0, i] = torch.from_numpy(seq.attitude[lo:hi])
+            imu_hi = int(seq.frame_imu_indices[t1])
+            lo = imu_hi - imu_context + 1
+            acc[0, i] = torch.from_numpy(seq.acc[lo : imu_hi + 1])
+            gyro[0, i] = torch.from_numpy(seq.gyro[lo : imu_hi + 1])
+            att[0, i] = torch.from_numpy(seq.attitude[lo : imu_hi + 1])
         out = model(
             f0.to(device), f1.to(device),
             acc.to(device), gyro.to(device), att.to(device).float(),
@@ -106,8 +107,6 @@ def _predict_sequence(
         gate_log[pos:end] = out["gate"][0].detach().mean(-1).cpu().numpy()
         pos = end
 
-    # The first ``imu_context`` pairs were skipped because they lacked
-    # IMU history. Fill them with identity (caller can crop these).
     rel_R[:rel_t_offset] = np.eye(3)
     return rel_t, rel_R, gate_log
 
@@ -176,7 +175,6 @@ def main() -> None:
     seq_names = args.sequences or PairedDataset.list_sequences(args.data_root)
     out_dir = Path(args.results_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    rte_step = max(1, int(round(args.imu_rate * args.rte_interval)))
 
     print(f"{'sequence':<20} {'ATE [m]':>10} {'RTE [m]':>10} {'rot [deg]':>12} "
           f"{'pairs':>8}")
@@ -189,20 +187,22 @@ def main() -> None:
                 model, seq, device, args.chunk, args.imu_context,
                 args.img_height, args.img_width,
             )
-            T0 = np.eye(4); T0[:3, :3] = seq.R[0]; T0[:3, 3] = seq.p[0]
+            T0 = np.eye(4); T0[:3, :3] = seq.R_cam[0]; T0[:3, 3] = seq.p_cam[0]
             world = _integrate(rel_R, rel_t, T0)
             n = world.shape[0]
+            # rte_step in camera-rate pairs (e.g. 5 s × 100 Hz = 500 pairs)
+            rte_step = max(1, int(round(args.rte_interval / seq.dt_cam)))
             metrics = trajectory_metrics(
                 pos_pred=world[:, :3, 3],
-                pos_gt=seq.p[:n],
+                pos_gt=seq.p_cam[:n],
                 R_pred=world[:, :3, :3],
-                R_gt=seq.R[:n],
+                R_gt=seq.R_cam[:n],
                 rte_step=rte_step,
                 aligned=False,
             )
             print(f"{name:<20} {metrics['ate']:>10.4f} {metrics['rte']:>10.4f} "
                   f"{metrics['rot_deg']:>12.4f} {n:>8d}")
-            _plot(name, world, {"pos_gt": seq.p[:n]}, metrics, gate_log, out_dir)
+            _plot(name, world, {"pos_gt": seq.p_cam[:n]}, metrics, gate_log, out_dir)
             aggregate["ate"].append(metrics["ate"])
             aggregate["rte"].append(metrics["rte"])
             aggregate["rot_deg"].append(metrics["rot_deg"])
