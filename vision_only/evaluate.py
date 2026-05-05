@@ -159,6 +159,20 @@ def evaluate_sequence(
     fig.savefig(out_dir / f"{seq.root.name}_trajectory.png", dpi=150)
     plt.close(fig)
 
+    fig = plt.figure(figsize=(8, 6))
+    ax3 = fig.add_subplot(111, projection="3d")
+    ax3.plot(pos_gt[:, 0], pos_gt[:, 1], pos_gt[:, 2], "b-", label="ground truth")
+    ax3.plot(pos_pred_aligned[:, 0], pos_pred_aligned[:, 1], pos_pred_aligned[:, 2], "r-", label="vision only")
+    ax3.scatter([pos_gt[0, 0]], [pos_gt[0, 1]], [pos_gt[0, 2]], c="green", s=60, label="start")
+    ax3.set_xlabel("X [m]")
+    ax3.set_ylabel("Y [m]")
+    ax3.set_zlabel("Z [m]")
+    ax3.set_title(f"{seq.root.name} — trajectory (3D)")
+    ax3.legend()
+    fig.tight_layout()
+    fig.savefig(out_dir / f"{seq.root.name}_trajectory_3d.png", dpi=150)
+    plt.close(fig)
+
     # Per-frame translation error (relative, unaligned).
     fig, ax = plt.subplots(figsize=(8, 3))
     ax.plot(rte_per_frame, "r-")
