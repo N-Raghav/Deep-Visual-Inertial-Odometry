@@ -1,10 +1,9 @@
 """
 Train the cross-attention tight-fusion network.
 
-Mirrors ``gated_fusion/train.py`` but replaces ``GatedFusionNet`` with
-``CrossAttentionFusionNet``. All other training mechanics are identical
-(Adam, warm-up with frozen backbones, joint fine-tune with smaller lr,
-cosine LR schedule, smooth-L1 + geodesic pose loss).
+Trains ``CrossAttentionFusionNet`` with Adam, warm-up with frozen backbones,
+joint fine-tune with smaller lr, cosine LR schedule, and smooth-L1 +
+geodesic pose loss.
 """
 
 from __future__ import annotations
@@ -26,7 +25,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from fusion_common.dataset import PairedDataset  # noqa: E402
-from fusion_common.loss import pose_loss  # noqa: E402
+from fusion_common.loss import pose_loss, trajectory_loss  # noqa: E402
 from model import CrossAttentionFusionNet  # noqa: E402
 
 
@@ -41,6 +40,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--lr_finetune", type=float, default=2e-5)
     p.add_argument("--lambda_rot", type=float, default=100.0)
+    p.add_argument("--lambda_traj", type=float, default=1.0,
+                   help="Weight on trajectory-level position+rotation loss.")
+    p.add_argument("--lambda_traj_rot", type=float, default=10.0,
+                   help="Weight on rotation within the trajectory loss.")
     p.add_argument("--sequence_length", type=int, default=10)
     p.add_argument("--imu_context", type=int, default=100)
     p.add_argument("--imu_rate", type=float, default=1000.0)
@@ -79,7 +82,7 @@ def split_sequences(root: str, val_fraction: float, seed: int) -> tuple[list[str
 
 def run_epoch(model, loader, optimizer, device, args, scaler, train):
     model.train(train)
-    sums = {"total": 0.0, "trans": 0.0, "rot_rad": 0.0, "vis_imu_cos": 0.0}
+    sums = {"total": 0.0, "trans": 0.0, "rot_rad": 0.0, "traj": 0.0, "vis_imu_cos": 0.0}
     n = 0
     for batch in loader:
         frames_t = batch["frames_t"].to(device, non_blocking=True)
@@ -97,6 +100,11 @@ def run_epoch(model, loader, optimizer, device, args, scaler, train):
             total, trans_l, rot_l = pose_loss(
                 out["trans"], trans_gt, out["R"], R_gt, lambda_rot=args.lambda_rot
             )
+            traj_l = trajectory_loss(
+                out["R"], out["trans"], R_gt, trans_gt,
+                lambda_rot=args.lambda_traj_rot,
+            )
+            total = total + args.lambda_traj * traj_l
         if train:
             if scaler is not None:
                 scaler.scale(total).backward()
@@ -111,6 +119,7 @@ def run_epoch(model, loader, optimizer, device, args, scaler, train):
         sums["total"] += float(total.detach())
         sums["trans"] += float(trans_l.detach())
         sums["rot_rad"] += float(rot_l.detach())
+        sums["traj"] += float(traj_l.detach())
         sums["vis_imu_cos"] += float(out["vis_imu_cos"].detach().mean())
         n += 1
 
@@ -120,6 +129,7 @@ def run_epoch(model, loader, optimizer, device, args, scaler, train):
         "trans": sums["trans"] / n,
         "rot_rad": sums["rot_rad"] / n,
         "rot_deg": math.degrees(sums["rot_rad"] / n),
+        "traj": sums["traj"] / n,
         "vis_imu_cos": sums["vis_imu_cos"] / n,
     }
 
@@ -204,7 +214,7 @@ def main() -> None:
         scheduler.step()
         lr = optimizer.param_groups[0]["lr"]
 
-        for k in ("total", "trans", "rot_deg", "vis_imu_cos"):
+        for k in ("total", "trans", "rot_deg", "traj", "vis_imu_cos"):
             writer.add_scalar(f"train/{k}", tr[k], epoch)
             writer.add_scalar(f"val/{k}", va[k], epoch)
         writer.add_scalar("lr", lr, epoch)
@@ -212,9 +222,9 @@ def main() -> None:
         print(
             f"[cross_attention epoch {epoch + 1:03d}/{args.epochs}] "
             f"train total={tr['total']:.4f} trans={tr['trans']:.4f} "
-            f"rot={tr['rot_deg']:.3f}deg cos={tr['vis_imu_cos']:.3f} | "
+            f"rot={tr['rot_deg']:.3f}deg traj={tr['traj']:.4f} cos={tr['vis_imu_cos']:.3f} | "
             f"val total={va['total']:.4f} trans={va['trans']:.4f} "
-            f"rot={va['rot_deg']:.3f}deg cos={va['vis_imu_cos']:.3f} | "
+            f"rot={va['rot_deg']:.3f}deg traj={va['traj']:.4f} cos={va['vis_imu_cos']:.3f} | "
             f"lr={lr:.2e}"
         )
 

@@ -21,7 +21,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.models import mobilenet_v2
 
-from utils import gram_schmidt
+try:
+    from vision_only.utils import gram_schmidt
+except ImportError:
+    from utils import gram_schmidt
 
 
 class CNNEncoder(nn.Module):

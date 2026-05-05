@@ -20,12 +20,20 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from utils import (
-    GRAVITY_VEC,
-    attitude_logmap_from_poses,
-    body_frame_velocity_from_poses,
-    quat_to_rotmat_np,
-)
+try:
+    from imu_only.utils import (
+        GRAVITY_VEC,
+        attitude_logmap_from_poses,
+        body_frame_velocity_from_poses,
+        quat_to_rotmat_np,
+    )
+except ImportError:
+    from utils import (
+        GRAVITY_VEC,
+        attitude_logmap_from_poses,
+        body_frame_velocity_from_poses,
+        quat_to_rotmat_np,
+    )
 
 
 def _load_imu_csv(path: Path) -> tuple[np.ndarray, np.ndarray]:

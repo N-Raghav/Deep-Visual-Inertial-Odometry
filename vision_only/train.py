@@ -16,6 +16,7 @@ import argparse
 import math
 import os
 import random
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -23,9 +24,13 @@ import torch
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
-from dataset import UAVOdometryDataset
-from loss import branch_a_loss
-from model import BranchA
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from dataset import UAVOdometryDataset  # noqa: E402
+from loss import branch_a_loss  # noqa: E402
+from model import BranchA  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -66,7 +71,6 @@ def split_sequences(
     val = sorted(seq_names[:n_val])
     train = sorted(seq_names[n_val:])
     if not train:
-        # Tiny datasets: keep at least one sequence in train.
         train = val[:1]
         val = val[1:]
     return train, val
@@ -81,11 +85,6 @@ def run_epoch(
     scaler: torch.cuda.amp.GradScaler | None,
     train: bool,
 ) -> dict[str, float]:
-    """Run one training or validation epoch.
-
-    Returns a dictionary with mean total / translation / rotation losses
-    over the epoch. Rotation loss is reported in degrees for readability.
-    """
     model.train(train)
 
     totals = {"total": 0.0, "trans": 0.0, "rot_rad": 0.0}
@@ -100,9 +99,6 @@ def run_epoch(
         if train:
             optimizer.zero_grad(set_to_none=True)
 
-        # Each batch starts a fresh trajectory window (sequences from the
-        # same trajectory are not shuffled across batches), so the LSTM
-        # hidden state is reset at every step.
         autocast_enabled = scaler is not None
         with torch.cuda.amp.autocast(enabled=autocast_enabled):
             trans_pred, _, R_pred, _, _ = model(frames_t, frames_t1, hidden=None)
@@ -208,16 +204,13 @@ def main() -> None:
         scheduler.step()
         lr = optimizer.param_groups[0]["lr"]
 
-        writer.add_scalar("train/total", train_metrics["total"], epoch)
-        writer.add_scalar("train/trans", train_metrics["trans"], epoch)
-        writer.add_scalar("train/rot_deg", train_metrics["rot_deg"], epoch)
-        writer.add_scalar("val/total", val_metrics["total"], epoch)
-        writer.add_scalar("val/trans", val_metrics["trans"], epoch)
-        writer.add_scalar("val/rot_deg", val_metrics["rot_deg"], epoch)
+        for k in ("total", "trans", "rot_deg"):
+            writer.add_scalar(f"train/{k}", train_metrics[k], epoch)
+            writer.add_scalar(f"val/{k}", val_metrics[k], epoch)
         writer.add_scalar("lr", lr, epoch)
 
         print(
-            f"[epoch {epoch + 1:03d}/{args.epochs}] "
+            f"[vision_only epoch {epoch + 1:03d}/{args.epochs}] "
             f"train total={train_metrics['total']:.4f} "
             f"trans={train_metrics['trans']:.4f} "
             f"rot={train_metrics['rot_deg']:.3f}deg | "

@@ -63,6 +63,7 @@ def _predict_sequence(model, seq, device, chunk, imu_context, img_h, img_w):
     cos_log = np.zeros((n_pairs,), dtype=np.float64)
     pos = int(np.searchsorted(seq.frame_imu_indices, imu_context - 1))
     rel_t_offset = pos
+    hidden = None
     while pos < n_pairs:
         end = min(pos + chunk, n_pairs)
         T = end - pos
@@ -83,7 +84,9 @@ def _predict_sequence(model, seq, device, chunk, imu_context, img_h, img_w):
         out = model(
             f0.to(device), f1.to(device),
             acc.to(device), gyro.to(device), att.to(device).float(),
+            hidden=hidden,
         )
+        hidden = (out["hidden"][0].detach(), out["hidden"][1].detach())
         rel_t[pos:end] = out["trans"][0].detach().cpu().numpy()
         rel_R[pos:end] = out["R"][0].detach().cpu().numpy()
         cos_log[pos:end] = out["vis_imu_cos"][0].detach().cpu().numpy()
@@ -113,6 +116,17 @@ def _plot(name, world, gt, metrics, cos_log, out_dir):
     ax.axis("equal"); ax.grid(True, alpha=0.3); ax.legend()
     fig.tight_layout()
     fig.savefig(out_dir / f"{name}_trajectory.png", dpi=150); plt.close(fig)
+
+    fig = plt.figure(figsize=(8, 6))
+    ax3 = fig.add_subplot(111, projection="3d")
+    ax3.plot(pos_gt[:, 0], pos_gt[:, 1], pos_gt[:, 2], "b-", label="ground truth")
+    ax3.plot(pos_pred[:, 0], pos_pred[:, 1], pos_pred[:, 2], "r-", label="cross-attn fusion")
+    ax3.scatter([pos_gt[0, 0]], [pos_gt[0, 1]], [pos_gt[0, 2]], c="green", s=60, label="start")
+    ax3.set_xlabel("X [m]"); ax3.set_ylabel("Y [m]"); ax3.set_zlabel("Z [m]")
+    ax3.set_title(f"{name} — trajectory (3D)")
+    ax3.legend()
+    fig.tight_layout()
+    fig.savefig(out_dir / f"{name}_trajectory_3d.png", dpi=150); plt.close(fig)
 
     for kind, series, ylabel in [
         ("trans", metrics["per_frame_trans"], "Position error [m]"),
@@ -169,7 +183,7 @@ def main() -> None:
                 R_pred=world[:, :3, :3],
                 R_gt=seq.R_cam[:n],
                 rte_step=rte_step,
-                aligned=False,
+                aligned=True,
             )
             print(f"{name:<20} {metrics['ate']:>10.4f} {metrics['rte']:>10.4f} "
                   f"{metrics['rot_deg']:>12.4f} {n:>8d}")

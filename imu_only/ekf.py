@@ -29,7 +29,10 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from utils import GRAVITY, so3_exp_np, so3_hat_np
+try:
+    from imu_only.utils import GRAVITY, so3_exp_np, so3_hat_np
+except ImportError:
+    from utils import GRAVITY, so3_exp_np, so3_hat_np
 
 
 def _skew(v: np.ndarray) -> np.ndarray:

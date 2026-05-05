@@ -1,9 +1,10 @@
 #!/bin/bash
 #SBATCH --job-name=cross_attn_train
-#SBATCH --output=logs/train_%j.out
-#SBATCH --error=logs/train_%j.err
-#SBATCH --time=24:00:00
-#SBATCH --partition=gpu
+#SBATCH --output=/home/rnallaperumal/deep-vio/cross_attention/logs/train_%j.out
+#SBATCH --error=/home/rnallaperumal/deep-vio/cross_attention/logs/train_%j.err
+#SBATCH --time=2-00:00:00
+#SBATCH --partition=academic
+#SBATCH --account=rbe577
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
@@ -21,7 +22,7 @@ if command -v module >/dev/null 2>&1; then
     module load cuda/12.1   || module load cuda/11.8   || module load cuda     || true
 fi
 
-PROJECT_DIR="${SLURM_SUBMIT_DIR:-$(pwd)}"
+PROJECT_DIR="/home/rnallaperumal/deep-vio/cross_attention"
 VENV_DIR="${VENV_DIR:-${PROJECT_DIR}/.venv}"
 
 if [ -z "${DATA_ROOT:-}" ]; then
@@ -47,6 +48,6 @@ python train.py \
     --num_heads "${NUM_HEADS:-4}" \
     --num_layers "${NUM_LAYERS:-2}" \
     --sequence_length "${SEQ_LEN:-10}" \
-    --imu_context "${IMU_CONTEXT:-32}" \
-    --imu_rate "${IMU_RATE:-30.0}" \
+    --imu_context "${IMU_CONTEXT:-100}" \
+    --imu_rate "${IMU_RATE:-1000.0}" \
     --num_workers "${NUM_WORKERS:-4}"

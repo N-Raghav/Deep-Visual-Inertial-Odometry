@@ -3,3 +3,8 @@
 blender-5.1.0-linux-x64
 
 *.sif
+pycache/
+__pycache__/
+checkpoints/
+logs/
+results/

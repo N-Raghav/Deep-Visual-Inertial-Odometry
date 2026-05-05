@@ -17,7 +17,10 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from utils import integrate_imu_window, so3_log
+try:
+    from imu_only.utils import integrate_imu_window, so3_log
+except ImportError:
+    from utils import integrate_imu_window, so3_log
 
 
 def geodesic_loss_stable(R_pred: torch.Tensor, R_gt: torch.Tensor) -> torch.Tensor:

@@ -33,6 +33,63 @@ def geodesic_loss_stable(R_pred: torch.Tensor, R_gt: torch.Tensor) -> torch.Tens
     return torch.atan2(skew_norm, cos_angle).mean()
 
 
+def integrate_relative_poses(
+    R_rel: torch.Tensor, t_rel: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Differentiably integrate relative poses into world-frame poses.
+
+    Args:
+        R_rel: ``[B, T, 3, 3]`` relative rotations.
+        t_rel: ``[B, T, 3]`` relative translations.
+
+    Returns:
+        ``(p_world, R_world)`` both starting from identity, shape ``[B, T+1, ...]``.
+    """
+    B = t_rel.shape[0]
+    device, dtype = t_rel.device, t_rel.dtype
+    R_cur = torch.eye(3, device=device, dtype=dtype).unsqueeze(0).expand(B, -1, -1)
+    p_cur = torch.zeros(B, 3, device=device, dtype=dtype)
+    p_list, R_list = [p_cur], [R_cur]
+    for i in range(t_rel.shape[1]):
+        p_cur = p_cur + (R_cur @ t_rel[:, i].unsqueeze(-1)).squeeze(-1)
+        R_cur = R_cur @ R_rel[:, i]
+        p_list.append(p_cur)
+        R_list.append(R_cur)
+    return torch.stack(p_list, dim=1), torch.stack(R_list, dim=1)
+
+
+def trajectory_loss(
+    R_pred: torch.Tensor,
+    t_pred: torch.Tensor,
+    R_gt: torch.Tensor,
+    t_gt: torch.Tensor,
+    lambda_rot: float = 10.0,
+) -> torch.Tensor:
+    """Trajectory-level loss: penalize drift in the integrated mini-trajectory.
+
+    Integrates T relative poses into world positions and rotations, then
+    supervises both (smooth-L1 on positions, geodesic on accumulated rotations).
+    This penalises systematic per-step bias that per-pair loss cannot see.
+
+    Args:
+        R_pred, R_gt: ``[B, T, 3, 3]``.
+        t_pred, t_gt: ``[B, T, 3]``.
+        lambda_rot: weight on the rotation term within this loss.
+    """
+    p_pred, R_pred_w = integrate_relative_poses(R_pred, t_pred)
+    p_gt, R_gt_w = integrate_relative_poses(R_gt, t_gt)
+
+    pos_loss = F.smooth_l1_loss(p_pred[:, 1:], p_gt[:, 1:])
+
+    B, T1 = R_pred_w.shape[:2]
+    T = T1 - 1
+    rot_loss = geodesic_loss_stable(
+        R_pred_w[:, 1:].reshape(B * T, 3, 3),
+        R_gt_w[:, 1:].reshape(B * T, 3, 3),
+    )
+    return pos_loss + lambda_rot * rot_loss
+
+
 def pose_loss(
     trans_pred: torch.Tensor,
     trans_gt: torch.Tensor,

@@ -2,7 +2,7 @@
 Cross-attention tight fusion of BranchA and AirIO features.
 
 Each modality contributes one token per timestep (after the same
-projection used by ``gated_fusion``). The two streams are concatenated
+projection to a shared feature dimension. The two streams are concatenated
 along the time axis with a learned modality embedding so the
 transformer can tell them apart, and a stack of standard transformer
 encoder layers performs *self*-attention over the combined ``2T``
@@ -143,19 +143,22 @@ class CrossAttentionFusionNet(nn.Module):
         imu_acc: torch.Tensor,
         imu_gyro: torch.Tensor,
         attitude: torch.Tensor,
+        hidden: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> dict[str, torch.Tensor]:
         """Predict per-pair relative pose with cross-modal attention.
 
-        Returns a dict with the same shapes as ``GatedFusionNet`` plus
-        an ``attn_marker`` tensor showing the average attention weight a
-        vision token assigns to its sibling IMU token, useful for a
-        diagnostic plot. (We compute it from the last layer's
-        attention via the tracker hook.)
+        Args:
+            hidden: optional BranchA LSTM state ``(h_n, c_n)`` from the
+                previous chunk. ``None`` resets the LSTM (start of sequence
+                or random training batch).
+
+        Returns a dict with keys matching ``GatedFusionNet`` plus
+        ``vis_imu_cos`` (cosine similarity diagnostic) and ``hidden``.
         """
         B, T = frames_t.shape[:2]
         W = imu_acc.shape[2]
 
-        _, _, _, _, vis_feat = self.branch_a(frames_t, frames_t1, hidden=None)
+        _, _, _, hidden_out, vis_feat = self.branch_a(frames_t, frames_t1, hidden=hidden)
 
         imu_acc_flat = imu_acc.reshape(B * T, W, 3)
         imu_gyro_flat = imu_gyro.reshape(B * T, W, 3)
@@ -201,6 +204,7 @@ class CrossAttentionFusionNet(nn.Module):
             "vis_token": v_out,
             "imu_token": u_out,
             "vis_imu_cos": cos,
+            "hidden": hidden_out,
         }
 
     # ------------------------------------------------------------------

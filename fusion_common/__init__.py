@@ -1,7 +1,6 @@
 """Shared utilities for the three fusion branches.
 
-Sibling fusion directories (``loose_fusion``, ``gated_fusion``,
-``cross_attention``) all need:
+Sibling fusion directories (``loose_fusion``, ``cross_attention``) all need:
 
     - the same paired vision-+-IMU dataset,
     - the same ``smooth_l1 + geodesic`` pose loss,

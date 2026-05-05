@@ -1,10 +1,9 @@
 """
 Smoke test for the cross-attention tight-fusion network.
 
-Mirrors ``gated_fusion/test_pipeline.py`` but exercises
-``CrossAttentionFusionNet`` instead. Same synthetic helical dataset,
-same shape and finiteness checks, plus a sanity check that the model's
-diagnostic ``vis_imu_cos`` lies in [-1, 1].
+Smoke test for ``CrossAttentionFusionNet``. Uses a synthetic helical
+dataset with shape and finiteness checks, plus a sanity check that the
+model's diagnostic ``vis_imu_cos`` lies in [-1, 1].
 """
 
 from __future__ import annotations
