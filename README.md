@@ -1,4 +1,4 @@
-# Deep Visual-Inertial Odometry — RBE/CS549 Project 4 (Group 7)
+# Deep Visual-Inertial Odometry 
 
 Submission for [Project 4](https://rbe549.github.io/spring2026/proj/p4/),
 Phase 2: a deep-learning visual-inertial odometry stack built around the
