@@ -117,7 +117,7 @@ For per-branch design notes, hyperparameters, and gotchas, see
 [loose_fusion/](loose_fusion/), and [cross_attention/](cross_attention/).
 
 ## Authors
-
+Raghav Nallaperumal and Prithvi Raj Baskar
 Group 7, RBE/CS549, Spring 2026, WPI.
 
 ## License
