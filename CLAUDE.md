@@ -2,7 +2,7 @@
 
 This repository implements a complete deep-learning Visual-Inertial
 Odometry stack for a downward-facing UAV camera observing a planar
-surface, with five interlocking branches. **Read this file first** —
+surface, with six interlocking branches. **Read this file first** —
 it explains how the pieces fit together, the dataset format the
 branches assume, the order in which things are trained, and the
 conventions used by every SLURM script.
@@ -16,25 +16,29 @@ deep-vio/
 ├── data_generation/            Blender pipeline that produces synthetic
 │                               sequences (frames + poses + IMU).
 ├── data/                       Generated datasets live here.
-├── cluster/                    Top-level cluster utilities (preexisting).
+├── cluster/                    Apptainer container + run helpers shared
+│                               across branches that lack their own venv.
 ├── vision_only/                Branch A — vision-only odometry (BranchA).
 ├── imu_only/                   AirIMU + AirIO + 15-state velocity EKF.
+├── prgflow/                    PRGFlow VIO baseline — cascaded SqueezeNet
+│                               patch-flow + Madgwick IMU attitude.
+├── prgflow_mod/                PRGFlow with an additional yaw head.
 ├── fusion_common/              Shared dataset / loss / metrics for the
-│                               three fusion branches.
+│                               two fusion branches below.
 ├── loose_fusion/               EKF-based loose coupling (no training).
-├── gated_fusion/               Tight coupling via per-dimension gating.
 ├── cross_attention/            Tight coupling via cross-modal transformer.
 └── CLAUDE.md                   This file.
 ```
 
-Five trainable / runnable branches in total:
+Six branches in total (five trainable + EKF-only loose fusion):
 
 | Branch | What it does | Trained? | Depends on |
 |---|---|---|---|
 | `vision_only`     | RGB → relative pose                                   | yes | dataset only |
 | `imu_only`        | IMU → body-frame velocity → trajectory via EKF        | yes | dataset only |
+| `prgflow`         | Cascaded SqueezeNet patch flow + Madgwick IMU → VIO   | yes | dataset only |
+| `prgflow_mod`     | PRGFlow + extra yaw head (cascaded t/y/s)             | yes | dataset only |
 | `loose_fusion`    | EKF fuses BranchA pose + AirIO velocity + AirIMU      | **no** | pretrained vision_only + imu_only checkpoints |
-| `gated_fusion`    | Tight fusion: gate softly mixes vision + IMU features | yes | pretrained backbones (recommended) |
 | `cross_attention` | Tight fusion: transformer cross-modal attention       | yes | pretrained backbones (recommended) |
 
 ---
@@ -272,9 +276,8 @@ If you skip AirIMU, AirIO trains on raw IMU directly — matches the
 
 ## Fusion shared library — `fusion_common/`
 
-Imported by `loose_fusion`, `gated_fusion`, and `cross_attention` via
-the standard sys-path injection pattern at the top of each entry
-script:
+Imported by `loose_fusion` and `cross_attention` via the standard
+sys-path injection pattern at the top of each entry script:
 
 ```python
 import sys
@@ -343,66 +346,68 @@ vision more.
 
 ---
 
-## Gated tight fusion — `gated_fusion/`
+## PRGFlow baselines — `prgflow/` and `prgflow_mod/`
 
-**Idea:** per-dimension soft switch between projected vision and IMU
-features.
+Course-provided VIO baselines used as comparators. Both branches are
+self-contained — they do **not** import `fusion_common`, do **not**
+share backbones with the other branches, and have no per-branch
+SLURM scripts (run via `cluster/` Apptainer container or manual
+`python` invocation).
+
+**Pipeline (both variants):**
+
+1. Per-frame center crop → `crop_size × crop_size` grayscale patch
+   (default 128).
+2. Madgwick filter integrates `(gyro, accel, dt)` from each frame's
+   IMU window to produce body attitude `R`.
+3. Inter-frame attitude change is converted to a homography
+   `H_R = K (Rₜᵀ Rₜ₊₁) K⁻¹` and used to rotation-compensate the
+   incoming patch before flow estimation.
+4. The network regresses a residual pseudo-similarity transform
+   between the previous patch and the rotation-compensated current
+   patch — output is `(scale, tx, ty)` (PRGFlow) or
+   `(scale, yaw, tx, ty)` (PRGFlow_mod).
+5. Body-frame velocity is recovered analytically from flow + altitude
+   (`v = patch_disp × altitude / (focal × dt)`), then rotated into
+   world frame and integrated. There is **no learned EKF** — this is
+   loose vision-IMU coupling with an analytic projection model.
+
+**Architecture:**
+
+- `PRGFlow` (in [prgflow/model.py](prgflow/model.py)): four cascaded
+  SqueezeNet heads `T₁ → S₁ → T₂ → S₂` (translation / scale,
+  alternating). Each head sees `[patch_t, warp(patch_{t+1}, H_total)]`
+  stacked on the channel dim and predicts a delta to `H_total`.
+  Final decomposition: `(s, tx, ty)`.
+- `PRGFlow_mod` (in [prgflow_mod/model.py](prgflow_mod/model.py)):
+  six cascaded heads `T₁ → Y₁ → S₁ → T₂ → Y₂ → S₂` adding two yaw
+  heads. Final decomposition: `(s, yaw, tx, ty)`.
+
+**Empirically the yaw head hurts** — see observation #5 in
+[Empirical observations](#empirical-observations-from-baseline-runs).
+Treat `prgflow_mod` as a cautionary tale, not an upgrade.
+
+Files (mirrored across `prgflow/` and `prgflow_mod/`):
 
 ```
-fused_d = g_d ⊙ vis_proj_d + (1 - g_d) ⊙ imu_proj_d
-g       = sigmoid(MLP([vis_proj ; imu_proj]))    # ∈ [0, 1]^D
+prgflow/
+├── model.py             PRGFlow cascaded SqueezeNet
+├── squeezenet.py        SHead, THead, fire blocks
+├── warp.py              homography compose / decompose / warp_image
+├── attitude.py          Madgwick filter
+├── fusion.py            VIOFusion: end-to-end attitude + flow → velocity
+├── dataset.py
+├── preprocess.py        cropping, normalization
+├── loss.py
+├── train.py             manual python invocation (no train.slurm)
+├── evaluate.py
+└── test.py              smoke test
 ```
 
-Both backbones are imported, **not** copied. `GatedFusionNet`:
-
-1. `BranchA(frames_t, frames_t1)` → exposes its post-FC `features
-   [B, T, 128]`.
-2. `_ImuFeatureExtractor` runs `AirIONet`'s CNN encoders + bi-GRU and
-   takes the **last** sample of every window as a per-pair feature
-   `[B, T, 256]`.
-3. `vis_proj` (128 → 128) and `imu_proj` (256 → 128) project both to
-   the shared dim `feat_dim=128`.
-4. Gate MLP `[2D → head_hidden=256 → D, sigmoid]` outputs the
-   per-dimension gate.
-5. `LayerNorm(fused)` → `trans_head` (3) and `rot_head` (6) →
-   `gram_schmidt(rot_6d)`.
-
-**Training:** Adam, weight_decay 1e-4, CosineAnnealingLR.
-- Phase 1 (`--warmup_epochs=5`): both backbones frozen, only gate +
-  projections + heads update at lr=1e-4.
-- Phase 2: full network unfrozen, lr drops to lr_finetune=2e-5.
-
-**Loss:** `pose_loss` (`λ_rot=100`).
-
-**Diagnostic plot:** `<seq>_gate.png` — mean gate value over time
-(1 = trusting vision, 0 = trusting IMU).
-
-Files:
-
-```
-gated_fusion/
-├── model.py             GatedFusionNet, _ImuFeatureExtractor
-├── train.py             warm-up + joint fine-tune
-├── evaluate.py          metrics + trajectory + gate plots
-├── test_pipeline.py
-├── setup_env.slurm, train.slurm, eval.slurm, test.slurm
-├── requirements.txt
-└── README.md
-```
-
-**Run:**
-
-```bash
-sbatch gated_fusion/setup_env.slurm
-sbatch gated_fusion/test.slurm
-sbatch --export=ALL,DATA_ROOT=/path,\
-              VISION_CKPT=../vision_only/checkpoints/branch_a/best.pt,\
-              AIRIO_CKPT=../imu_only/checkpoints/airio/best.pt \
-       gated_fusion/train.slurm
-sbatch --export=ALL,DATA_ROOT=/path,\
-              CHECKPOINT=checkpoints/gated_fusion/best.pt \
-       gated_fusion/eval.slurm
-```
+**Run:** no SLURM scripts. Either drive via the shared Apptainer
+container in `cluster/` or run `python train.py` / `python
+evaluate.py` directly inside an environment that has the same
+PyTorch + numpy + scipy + opencv stack as the other branches.
 
 ---
 
@@ -415,8 +420,11 @@ self-attention and cross-modality attention but parameter-shared.
 
 `CrossAttentionFusionNet`:
 
-1. Same `BranchA` features and `AirIO` last-sample-per-window
-   features as the gated branch (projections to `feat_dim=128`).
+1. `BranchA(frames_t, frames_t1)` exposes its post-FC `features
+   [B, T, 128]`. `_ImuFeatureExtractor` runs `AirIONet`'s CNN encoders
+   + bi-GRU and takes the **last** sample of each window as a per-pair
+   feature `[B, T, 256]`. Both projected to `feat_dim=128` via
+   `vis_proj` (128 → 128) and `imu_proj` (256 → 128).
 2. Add learned modality embedding (`(2, D)` table) + learned temporal
    positional embedding (`(max_len, D)`) — same temporal embedding
    shared across modalities, modality embedding distinguishes them.
@@ -424,25 +432,30 @@ self-attention and cross-modality attention but parameter-shared.
    layers by default, 4 heads, FFN width 256, GELU, `norm_first=True`,
    `batch_first=True`).
 4. LayerNorm; readout = mean of vision-half and IMU-half output
-   tokens at each `t`. Same `trans_head` and `rot_head` as gated.
+   tokens at each `t`. `trans_head` (3) and `rot_head` (6) →
+   `gram_schmidt(rot_6d)`.
 
-**Training:** identical schedule to gated (Adam, weight_decay,
-CosineAnnealingLR, warm-up + joint fine-tune). Extra args:
-`--feat_dim`, `--num_heads`, `--num_layers`, `--ffn_hidden`,
-`--dropout`.
+**Training:** Adam, weight_decay 1e-4, CosineAnnealingLR with
+warm-up + joint fine-tune.
+- Phase 1 (`--warmup_epochs=5`): both backbones frozen, only the
+  transformer + projections + heads update at lr=1e-4.
+- Phase 2: full network unfrozen, lr drops to lr_finetune=2e-5.
 
-**Loss:** `pose_loss`.
+Extra args: `--feat_dim`, `--num_heads`, `--num_layers`,
+`--ffn_hidden`, `--dropout`.
+
+**Loss:** `pose_loss` (`λ_rot=100`).
 
 **Diagnostic plot:** `<seq>_vis_imu_cos.png` — per-timestep cosine
-similarity between the two output tokens (vision vs IMU). Closest
-analogue to gated's gate plot.
+similarity between the two output tokens (vision vs IMU). Low
+similarity = modalities disagree; the transformer is reconciling.
 
 Files:
 
 ```
 cross_attention/
 ├── model.py             CrossAttentionFusionNet, _ImuFeatureExtractor
-├── train.py             same shape as gated_fusion/train.py + transformer args
+├── train.py             warm-up + joint fine-tune + transformer args
 ├── evaluate.py
 ├── test_pipeline.py
 ├── setup_env.slurm, train.slurm, eval.slurm, test.slurm
@@ -482,12 +495,14 @@ To go from a fresh dataset to evaluation of every method:
             │                            │
             └────────────┬───────────────┘
                          ▼
-       ┌─────────────────┼─────────────────────┐
-       ▼                 ▼                     ▼
- loose_fusion/eval  gated_fusion/train   cross_attention/train
-                         │                     │
-                         ▼                     ▼
-                   gated/eval            cross_attention/eval
+            ┌────────────┴────────────┐
+            ▼                         ▼
+      loose_fusion/eval     cross_attention/train
+                                      │
+                                      ▼
+                              cross_attention/eval
+
+  (PRGFlow baselines run independently on data/<run>/.)
 ```
 
 Or in shell:
@@ -508,11 +523,7 @@ sbatch --export=ALL,DATA_ROOT=$D,\
               AIRIMU_CKPT=imu_only/checkpoints/airimu/best.pt \
        loose_fusion/eval.slurm
 
-# 3. Tight fusion (independent training runs)
-sbatch --export=ALL,DATA_ROOT=$D,\
-              VISION_CKPT=vision_only/checkpoints/branch_a/best.pt,\
-              AIRIO_CKPT=imu_only/checkpoints/airio/best.pt \
-       gated_fusion/train.slurm
+# 3. Tight fusion (independent training run)
 sbatch --export=ALL,DATA_ROOT=$D,\
               VISION_CKPT=vision_only/checkpoints/branch_a/best.pt,\
               AIRIO_CKPT=imu_only/checkpoints/airio/best.pt \
@@ -528,14 +539,16 @@ imported modules see whatever venv the importing branch is using.
 
 ## SLURM script conventions
 
-Every branch has a near-identical set:
+`vision_only`, `imu_only`, `loose_fusion`, and `cross_attention` each
+have a near-identical set (`prgflow` and `prgflow_mod` do not — they
+share the Apptainer container in `cluster/` instead):
 
 | File | Job | Notes |
 |---|---|---|
 | `setup_env.slurm` | one-time venv create + torch + reqs | overridable via `TORCH_INDEX_URL` (default `cu121`) |
 | `test.slurm`      | `python test_pipeline.py`            | ~1 min, runs the smoke test on synthetic data |
 | `train*.slurm`    | `python train*.py`                   | reads everything from `${VAR:-default}` env vars |
-| `eval.slurm`      | `python evaluate.py`                 | only loose / gated / cross_attention; `imu_only` and `vision_only` use train.slurm + a manual eval |
+| `eval.slurm`      | `python evaluate.py`                 | only loose / cross_attention; `imu_only` and `vision_only` use train.slurm + a manual eval |
 
 All scripts:
 - `set -euo pipefail`,
@@ -547,7 +560,7 @@ All scripts:
 
 To override anything pass it via `--export=ALL,VAR=value` at submit
 time. Example: `sbatch --export=ALL,EPOCHS=200,LR=5e-5
-gated_fusion/train.slurm`.
+cross_attention/train.slurm`.
 
 ---
 
@@ -724,10 +737,6 @@ These observations directly motivate specific fusion design choices:
   patches AirIO's biggest weakness. Tune
   `--vision_rot_sigma_deg` aggressively low (0.1-0.3°) before
   `--vision_vel_sigma`.
-- **Gated fusion should learn `g → 1` (trust vision) on `_102`
-  instances.** Plot `<seq>_gate.png` for `clover_102` after training:
-  if the gate isn't strongly biased toward vision there, the network
-  hasn't learned the right behaviour.
 - **Cross-attention's interpretability is via `vis_imu_cos`.** Low
   cosine similarity on `clover_102` means the modalities disagree
   (which is correct — IMU is failing) and the transformer is
@@ -740,8 +749,8 @@ These observations directly motivate specific fusion design choices:
 - **The bar to beat (small set, 5 trajectories).** PRGFlow VIO scores
   ATE 0.72 m, RTE 0.005 m, rotation 6.9°. Loose fusion is unlikely to
   beat this outright (PRGFlow is already tightly-coupled VIO); the
-  interesting comparison is `gated_fusion` and `cross_attention`
-  versus PRGFlow on identical sequences.
+  interesting comparison is `cross_attention` versus PRGFlow on
+  identical sequences.
 
 ---
 
@@ -759,8 +768,6 @@ load-bearing papers:
 - Qiu, Y. et al., 2023. "AirIMU." (imu_only AirIMU sub-network)
 - Forster, C. et al., 2015. "IMU Preintegration on Manifold." *RSS*.
   (EKF kinematic model)
-- Clark, R. et al., 2017. "VINet." *AAAI*. (gated_fusion / fusion design)
-- Chen, C. et al., 2019. "Selective Sensor Fusion for Neural
-  Visual-Inertial Odometry." *CVPR*. (gated_fusion)
+- Clark, R. et al., 2017. "VINet." *AAAI*. (cross_attention / fusion design)
 - Vaswani, A. et al., 2017. "Attention Is All You Need." *NeurIPS*.
   (cross_attention)
